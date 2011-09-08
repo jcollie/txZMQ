@@ -8,6 +8,7 @@ from zmq.core.socket import Socket
 from zmq.core import constants, error
 
 from zope.interface import implements
+from twisted.internet import reactor
 from twisted.internet.interfaces import IReadDescriptor, IFileDescriptor
 from twisted.python import log
 
@@ -68,6 +69,7 @@ class ZmqConnection(object):
         self.socket = Socket(factory.context, self.socketType)
         self.queue = deque()
         self.recv_parts = []
+        self._queued_read = None
 
         self.fd = self.socket.getsockopt(constants.FD)
         self.socket.setsockopt(constants.LINGER, factory.lingerPeriod)
@@ -86,6 +88,8 @@ class ZmqConnection(object):
         Shutdown connection and socket.
         """
         self.factory.reactor.removeReader(self)
+        if self._queued_read and self._queued_read.active():
+            self._queued_read.cancel()
 
         self.factory.connections.discard(self)
 
@@ -124,6 +128,8 @@ class ZmqConnection(object):
         """
         log.err(reason, "Connection to ZeroMQ lost in %r" % (self))
         self.factory.reactor.removeReader(self)
+        if self._queued_read and self._queued_read.active():
+            self._queued_read.cancel()
 
     def _readMultipart(self):
         """
@@ -197,6 +203,9 @@ class ZmqConnection(object):
             self.queue.append((0, message[-1]))
 
         self._startWriting()
+        # we might have missed an event, queue a read
+        if self._queued_read is None or self._queued_read.called:
+            self._queued_read = reactor.callLater(0, self.doRead)
 
     def messageReceived(self, message):
         """
