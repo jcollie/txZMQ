@@ -70,6 +70,7 @@ class ZmqConnection(object):
         self.socket = Socket(factory.context, self.socketType)
         self.queue = deque()
         self.recv_parts = []
+        self.disconnected = 0
         self._queued_read = None
 
         self.fd = self.socket.getsockopt(constants.FD)
@@ -100,6 +101,7 @@ class ZmqConnection(object):
         self.socket = None
 
         self.factory = None
+        self.disconnected = 1
 
     def __repr__(self):
         return "%s(%r, %r)" % (self.__class__.__name__, self.factory, self.endpoints)
@@ -157,6 +159,8 @@ class ZmqConnection(object):
         events = self.socket.getsockopt(constants.EVENTS)
         if (events & constants.POLLIN) == constants.POLLIN:
             while True:
+                if self.disconnected:
+                    return
                 try:
                     message = self._readMultipart()
                 except error.ZMQError as e:
