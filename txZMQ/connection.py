@@ -54,6 +54,7 @@ class ZmqConnection(object):
     allowLoopbackMulticast = False
     multicastRate = 100
     highWaterMark = 0
+    identity = None
 
     def __init__(self, factory, *endpoints):
         """
@@ -76,6 +77,8 @@ class ZmqConnection(object):
         self.socket.setsockopt(constants.MCAST_LOOP, int(self.allowLoopbackMulticast))
         self.socket.setsockopt(constants.RATE, self.multicastRate)
         self.socket.setsockopt(constants.HWM, self.highWaterMark)
+        if self.identity is not None:
+            self.socket.setsockopt(constants.IDENTITY, self.identity)
 
         self._connectOrBind()
 
