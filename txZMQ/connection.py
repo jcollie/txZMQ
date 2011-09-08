@@ -132,7 +132,8 @@ class ZmqConnection(object):
                        failure may be of other classes as well.
         """
         log.err(reason, "Connection to ZeroMQ lost in %r" % (self))
-        self.factory.reactor.removeReader(self)
+        if self.factory:
+            self.factory.reactor.removeReader(self)
         if self._queued_read and self._queued_read.active():
             self._queued_read.cancel()
 
