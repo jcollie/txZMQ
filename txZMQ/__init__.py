@@ -8,4 +8,4 @@ from txZMQ.pubsub import ZmqPubConnection, ZmqSubConnection
 from txZMQ.xreq_xrep import ZmqXREQConnection
 
 
-__all__ = ['ZmqFactory', 'ZmqEndpointType', 'ZmqEndpoint', 'ZmqConnection', 'ZmqPubConnection', 'ZmqSubConnection', 'ZmqXREQConnection']
+__all__ = ['ZmqFactory', 'ZmqEndpointType', 'ZmqEndpoint', 'ZmqConnection', 'ZmqPubConnection', 'ZmqSubConnection', 'ZmqXREPConnection', 'ZmqXREQConnection']
