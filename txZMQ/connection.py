@@ -9,7 +9,10 @@ from zmq.core import constants, error
 
 from zope.interface import implements
 from twisted.internet import reactor
-from twisted.internet.interfaces import IReadDescriptor, IFileDescriptor
+from twisted.internet.interfaces import IReadDescriptor
+from twisted.internet.interfaces import IFileDescriptor
+from twisted.internet import defer
+
 from twisted.python import log
 
 
@@ -23,6 +26,7 @@ class ZmqEndpointType(object):
 
 ZmqEndpoint = namedtuple('ZmqEndpoint', ['type', 'address'])
 
+ZmqQueueEntry = namedtuple('ZmqQueueEntry', ['send_completed', 'messages'])
 
 class ZmqConnection(object):
     """
@@ -45,8 +49,8 @@ class ZmqConnection(object):
     @type endpoints: C{list} of L{ZmqEndpoint}
     @ivar fd: file descriptor of zmq mailbox
     @type fd: C{int}
-    @ivar queue: output message queue
-    @type queue: C{deque}
+    @ivar _write_queue: output message queue
+    @type _write_queue: C{deque}
     """
     implements(IReadDescriptor, IFileDescriptor)
 
@@ -68,13 +72,15 @@ class ZmqConnection(object):
         self.factory = factory
         self.endpoints = endpoints
         self.socket = Socket(factory.context, self.socketType)
-        self.queue = deque()
-        self.recv_parts = []
-        self.disconnected = 0
+
+        self._waiting_recvs = deque()
+        self._write_queue = deque()
+        self._recv_parts = []
+        self._disconnected = 0
         self._queued_read = None
 
-        self.fd = self.socket.getsockopt(constants.FD)
-        self.socket.setsockopt(constants.LINGER, factory.lingerPeriod)
+        self._fd = self.socket.getsockopt(constants.FD)
+        self.socket.setsockopt(constants.LINGER, self.factory.lingerPeriod)
         self.socket.setsockopt(constants.MCAST_LOOP, int(self.allowLoopbackMulticast))
         self.socket.setsockopt(constants.RATE, self.multicastRate)
         self.socket.setsockopt(constants.HWM, self.highWaterMark)
@@ -91,17 +97,23 @@ class ZmqConnection(object):
         """
         Shutdown connection and socket.
         """
-        self.factory.reactor.removeReader(self)
+        if self.factory:
+            self.factory.reactor.removeReader(self)
+
         if self._queued_read and self._queued_read.active():
             self._queued_read.cancel()
 
-        self.factory.connections.discard(self)
+        if self.factory:
+            self.factory.connections.discard(self)
+
+        for waiting_recv in self._waiting_recvs:
+            waiting_recv.errback(None)
 
         self.socket.close()
         self.socket = None
 
         self.factory = None
-        self.disconnected = 1
+        self._disconnected = 1
 
     def __repr__(self):
         return "%s(%r, %r)" % (self.__class__.__name__, self.factory, self.endpoints)
@@ -113,7 +125,7 @@ class ZmqConnection(object):
         @return: The platform-specified representation of a file descriptor
                  number.
         """
-        return self.fd
+        return self._fd
 
     def connectionLost(self, reason):
         """
@@ -121,10 +133,10 @@ class ZmqConnection(object):
 
         Part of L{IFileDescriptor}.
 
-        This is called when the connection on a selectable object has been
-        lost.  It will be called whether the connection was closed explicitly,
-        an exception occurred in an event handler, or the other end of the
-        connection closed it first.
+        This is called when the connection on a selectable object has
+        been lost.  It will be called whether the connection was
+        closed explicitly, an exception occurred in an event handler,
+        or the other end of the connection closed it first.
 
         @param reason: A failure instance indicating the reason why the
                        connection was lost.  L{error.ConnectionLost} and
@@ -139,14 +151,14 @@ class ZmqConnection(object):
 
     def _readMultipart(self):
         """
-        Read multipart in non-blocking manner, returns with ready message
-        or raising exception (in case of no more messages available).
+        Read multipart in non-blocking manner, returns with ready
+        message or raising exception (in case of no more messages
+        available).
         """
         while True:
-            self.recv_parts.append(self.socket.recv(constants.NOBLOCK))
+            self._recv_parts.append(self.socket.recv(constants.NOBLOCK))
             if not self.socket.rcvmore():
-                result, self.recv_parts = self.recv_parts, []
-
+                result, self._recv_parts = self._recv_parts, []
                 return result
 
     def doRead(self):
@@ -157,20 +169,24 @@ class ZmqConnection(object):
 
         Part of L{IReadDescriptor}.
         """
+
+        if self._disconnected:
+            return
+
         events = self.socket.getsockopt(constants.EVENTS)
-        if (events & constants.POLLIN) == constants.POLLIN:
-            while True:
-                if self.disconnected:
-                    return
+
+        if self._waiting_recvs and (events & constants.POLLIN) == constants.POLLIN:
+            while self._waiting_recvs:
                 try:
                     message = self._readMultipart()
+                    self._waiting_recvs.popleft().callback(message)
+
                 except error.ZMQError as e:
                     if e.errno == constants.EAGAIN:
                         break
 
                     raise e
 
-                log.callWithLogger(self, self.messageReceived, message)
         if (events & constants.POLLOUT) == constants.POLLOUT:
             self._startWriting()
 
@@ -178,16 +194,16 @@ class ZmqConnection(object):
         """
         Start delivering messages from the queue.
         """
-        while self.queue:
+        while self._write_queue:
             try:
-                self.socket.send(self.queue[0][1], constants.NOBLOCK | self.queue[0][0])
+                for option, message in self._write_queue[0].messages:
+                    self.socket.send(message, constants.NOBLOCK | option)
+                self._write_queue.popleft().send_completed.callback(None)
             except error.ZMQError as e:
                 if e.errno == constants.EAGAIN:
                     break
-                self.queue.popleft()
+                self._write_queue.popleft()
                 raise e
-
-            self.queue.popleft()
 
     def logPrefix(self):
         """
@@ -204,24 +220,33 @@ class ZmqConnection(object):
 
         @param message: message data
         """
-        if not hasattr(message, '__iter__'):
-            self.queue.append((0, message))
-        else:
-            self.queue.extend([(constants.SNDMORE, m) for m in message[:-1]])
-            self.queue.append((0, message[-1]))
+        send_completed = defer.Deferred()
 
+        if not hasattr(message, '__iter__'):
+            message = ZmqQueueEntry(send_completed, [(0, message)])
+
+        else:
+            message = ZmqQueueEntry(send_completed, [(constants.SNDMORE, part) for part in message])
+            message.messages[-1] = (0, message.messages[-1][1])
+
+        self._write_queue.append(message)
         self._startWriting()
+
         # we might have missed an event, queue a read
         if self._queued_read is None or self._queued_read.called:
             self._queued_read = reactor.callLater(0, self.doRead)
+        
+        return send_completed
 
-    def messageReceived(self, message):
-        """
-        Called on incoming message from ZeroMQ.
-
-        @param message: message data
-        """
-        raise NotImplementedError(self)
+    def recv(self):
+        waiting_recv = defer.Deferred()
+        self._waiting_recvs.append(waiting_recv)
+        
+        # queue a read
+        if self._queued_read is None or self._queued_read.called:
+            self._queued_read = reactor.callLater(0, self.doRead)
+        
+        return waiting_recv
 
     def _connectOrBind(self):
         """
